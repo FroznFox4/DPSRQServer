@@ -1,26 +1,42 @@
 package partysync
 
 import (
+	"context"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	pb "github.com/kirill/gamelogserver/internal/partysync/pb"
 )
+
+// DefaultBroadcastInterval is the max frequency at which PartyState is sent to clients.
+const DefaultBroadcastInterval = 300 * time.Millisecond
 
 // Room holds all active streams and latest snapshots for one party room.
 type Room struct {
 	streams   map[string]pb.PartySync_SyncDamageServer
 	snapshots map[string]*pb.PlayerSnapshot
 	mu        sync.RWMutex
+	dirty     atomic.Bool
+	cancel    context.CancelFunc
 }
 
 // Hub manages all rooms.
 type Hub struct {
-	rooms map[string]*Room
-	mu    sync.RWMutex
+	rooms    map[string]*Room
+	mu       sync.RWMutex
+	interval time.Duration
 }
 
 func NewHub() *Hub {
-	return &Hub{rooms: make(map[string]*Room)}
+	return newHubWithInterval(DefaultBroadcastInterval)
+}
+
+func newHubWithInterval(interval time.Duration) *Hub {
+	return &Hub{
+		rooms:    make(map[string]*Room),
+		interval: interval,
+	}
 }
 
 func (h *Hub) getOrCreateRoom(roomID string) *Room {
@@ -29,12 +45,31 @@ func (h *Hub) getOrCreateRoom(roomID string) *Room {
 	if r, ok := h.rooms[roomID]; ok {
 		return r
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	r := &Room{
 		streams:   make(map[string]pb.PartySync_SyncDamageServer),
 		snapshots: make(map[string]*pb.PlayerSnapshot),
+		cancel:    cancel,
 	}
 	h.rooms[roomID] = r
+	go r.broadcastLoop(ctx, h.interval)
 	return r
+}
+
+// broadcastLoop ticks every interval and sends PartyState if the room was updated.
+func (r *Room) broadcastLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if r.dirty.Swap(false) {
+				r.broadcast()
+			}
+		}
+	}
 }
 
 // Join registers a player stream in the room.
@@ -45,7 +80,7 @@ func (h *Hub) Join(roomID, player string, stream pb.PartySync_SyncDamageServer) 
 	r.mu.Unlock()
 }
 
-// Leave removes a player stream from the room.
+// Leave removes a player from the room. Deletes the room when it becomes empty.
 func (h *Hub) Leave(roomID, player string) {
 	h.mu.RLock()
 	r, ok := h.rooms[roomID]
@@ -61,13 +96,14 @@ func (h *Hub) Leave(roomID, player string) {
 	r.mu.Unlock()
 
 	if empty {
+		r.cancel()
 		h.mu.Lock()
 		delete(h.rooms, roomID)
 		h.mu.Unlock()
 	}
 }
 
-// Update saves a player snapshot and broadcasts PartyState to all room members.
+// Update saves a player snapshot and marks the room dirty for the next broadcast tick.
 func (h *Hub) Update(roomID string, msg *pb.DamageUpdate) {
 	r := h.getOrCreateRoom(roomID)
 
@@ -82,11 +118,11 @@ func (h *Hub) Update(roomID string, msg *pb.DamageUpdate) {
 	r.snapshots[msg.Player] = snap
 	r.mu.Unlock()
 
-	h.broadcast(r)
+	r.dirty.Store(true)
 }
 
-// broadcast sends current PartyState to all streams in the room.
-func (h *Hub) broadcast(r *Room) {
+// broadcast sends the current PartyState to all streams in the room.
+func (r *Room) broadcast() {
 	r.mu.RLock()
 	state := &pb.PartyState{
 		Players: make(map[string]*pb.PlayerSnapshot, len(r.snapshots)),
@@ -101,7 +137,6 @@ func (h *Hub) broadcast(r *Room) {
 	r.mu.RUnlock()
 
 	for _, stream := range streams {
-		// Non-blocking: ignore errors from individual streams (client may have disconnected)
 		_ = stream.Send(state)
 	}
 }

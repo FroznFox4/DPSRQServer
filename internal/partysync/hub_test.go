@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/metadata"
 
@@ -53,8 +54,14 @@ func (m *mockStream) Context() context.Context             { return m.ctx }
 func (m *mockStream) SendMsg(interface{}) error            { return nil }
 func (m *mockStream) RecvMsg(interface{}) error            { return nil }
 
+// newTestHub returns a Hub with a very short broadcast interval for unit tests.
+func newTestHub() *Hub { return newHubWithInterval(5 * time.Millisecond) }
+
+// tick waits long enough for at least one broadcast tick to fire.
+func tick() { time.Sleep(20 * time.Millisecond) }
+
 func TestHub_JoinAndUpdate_BroadcastsToJoinedStream(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	s := newMockStream()
 
 	hub.Join("room1", "Alice", s)
@@ -63,12 +70,12 @@ func TestHub_JoinAndUpdate_BroadcastsToJoinedStream(t *testing.T) {
 		Room:        "room1",
 		TotalDamage: 500,
 	})
+	tick()
 
-	if s.sentCount() != 1 {
-		t.Fatalf("expected 1 broadcast, got %d", s.sentCount())
+	if s.sentCount() == 0 {
+		t.Fatal("expected at least 1 broadcast, got 0")
 	}
-	state := s.lastSent()
-	snap, ok := state.Players["Alice"]
+	snap, ok := s.lastSent().Players["Alice"]
 	if !ok {
 		t.Fatal("Alice not found in PartyState")
 	}
@@ -78,7 +85,7 @@ func TestHub_JoinAndUpdate_BroadcastsToJoinedStream(t *testing.T) {
 }
 
 func TestHub_MultiplePlayersReceiveAllBroadcasts(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	sA := newMockStream()
 	sB := newMockStream()
 
@@ -87,15 +94,16 @@ func TestHub_MultiplePlayersReceiveAllBroadcasts(t *testing.T) {
 
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
 	hub.Update("room1", &pb.DamageUpdate{Player: "Bob", Room: "room1", TotalDamage: 200})
+	tick()
 
-	if sA.sentCount() != 2 {
-		t.Errorf("Alice: expected 2 broadcasts, got %d", sA.sentCount())
+	if sA.sentCount() == 0 {
+		t.Error("Alice: expected at least 1 broadcast, got 0")
 	}
-	if sB.sentCount() != 2 {
-		t.Errorf("Bob: expected 2 broadcasts, got %d", sB.sentCount())
+	if sB.sentCount() == 0 {
+		t.Error("Bob: expected at least 1 broadcast, got 0")
 	}
 
-	// Last state must contain both players
+	// Both players must appear in the last broadcast
 	last := sA.lastSent()
 	if _, ok := last.Players["Alice"]; !ok {
 		t.Error("Alice missing from final state")
@@ -106,26 +114,50 @@ func TestHub_MultiplePlayersReceiveAllBroadcasts(t *testing.T) {
 }
 
 func TestHub_PartyStateContainsLatestSnapshot(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	s := newMockStream()
 	hub.Join("room1", "Alice", s)
 
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 900})
+	tick()
 
 	last := s.lastSent()
+	if last == nil {
+		t.Fatal("expected at least 1 broadcast")
+	}
 	if last.Players["Alice"].TotalDamage != 900 {
 		t.Errorf("expected latest snapshot TotalDamage=900, got %d", last.Players["Alice"].TotalDamage)
 	}
 }
 
+func TestHub_ThrottlesBatchedUpdatesIntoOneBroadcast(t *testing.T) {
+	hub := newTestHub()
+	s := newMockStream()
+	hub.Join("room1", "Alice", s)
+
+	// Send 10 updates within a single tick window — expect exactly 1 broadcast.
+	for i := 0; i < 10; i++ {
+		hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: int64(i * 100)})
+	}
+	tick()
+
+	if s.sentCount() != 1 {
+		t.Errorf("expected 1 broadcast for 10 rapid updates, got %d", s.sentCount())
+	}
+	if s.lastSent().Players["Alice"].TotalDamage != 900 {
+		t.Errorf("expected last value 900, got %d", s.lastSent().Players["Alice"].TotalDamage)
+	}
+}
+
 func TestHub_Leave_StopsReceivingBroadcasts(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	s := newMockStream()
 
 	hub.Join("room1", "Alice", s)
 	hub.Leave("room1", "Alice")
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 999})
+	tick()
 
 	if s.sentCount() != 0 {
 		t.Errorf("expected 0 broadcasts after Leave, got %d", s.sentCount())
@@ -133,7 +165,7 @@ func TestHub_Leave_StopsReceivingBroadcasts(t *testing.T) {
 }
 
 func TestHub_Leave_RemovesSnapshotFromBroadcast(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	sA := newMockStream()
 	sB := newMockStream()
 
@@ -141,10 +173,11 @@ func TestHub_Leave_RemovesSnapshotFromBroadcast(t *testing.T) {
 	hub.Join("room1", "Bob", sB)
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
 	hub.Update("room1", &pb.DamageUpdate{Player: "Bob", Room: "room1", TotalDamage: 200})
+	tick()
 
 	hub.Leave("room1", "Alice")
-	// Bob sends update — state should only contain Bob
 	hub.Update("room1", &pb.DamageUpdate{Player: "Bob", Room: "room1", TotalDamage: 300})
+	tick()
 
 	last := sB.lastSent()
 	if _, ok := last.Players["Alice"]; ok {
@@ -156,7 +189,7 @@ func TestHub_Leave_RemovesSnapshotFromBroadcast(t *testing.T) {
 }
 
 func TestHub_EmptyRoomDeletedAfterLastLeave(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	s := newMockStream()
 
 	hub.Join("room1", "Alice", s)
@@ -172,18 +205,17 @@ func TestHub_EmptyRoomDeletedAfterLastLeave(t *testing.T) {
 }
 
 func TestHub_UpdateUnknownRoom_DoesNotPanic(t *testing.T) {
-	hub := NewHub()
-	// Should not panic even with no streams in the room
+	hub := newTestHub()
 	hub.Update("nonexistent", &pb.DamageUpdate{Player: "Ghost", Room: "nonexistent", TotalDamage: 1})
 }
 
 func TestHub_LeaveUnknownRoom_DoesNotPanic(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	hub.Leave("nonexistent", "Ghost")
 }
 
 func TestHub_TargetDamagePreservedInSnapshot(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	s := newMockStream()
 	hub.Join("room1", "Alice", s)
 
@@ -198,6 +230,7 @@ func TestHub_TargetDamagePreservedInSnapshot(t *testing.T) {
 		LastHit:   500,
 		LastHitTs: "2026-03-13 12:00:00",
 	})
+	tick()
 
 	snap := s.lastSent().Players["Alice"]
 	if len(snap.Targets) != 2 {
@@ -212,7 +245,7 @@ func TestHub_TargetDamagePreservedInSnapshot(t *testing.T) {
 }
 
 func TestHub_MultipleRoomsAreIsolated(t *testing.T) {
-	hub := NewHub()
+	hub := newTestHub()
 	s1 := newMockStream()
 	s2 := newMockStream()
 
@@ -220,9 +253,10 @@ func TestHub_MultipleRoomsAreIsolated(t *testing.T) {
 	hub.Join("room2", "Bob", s2)
 
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
+	tick()
 
-	if s1.sentCount() != 1 {
-		t.Errorf("room1: expected 1 broadcast, got %d", s1.sentCount())
+	if s1.sentCount() == 0 {
+		t.Errorf("room1: expected at least 1 broadcast, got 0")
 	}
 	if s2.sentCount() != 0 {
 		t.Errorf("room2: expected 0 broadcasts (isolated), got %d", s2.sentCount())
