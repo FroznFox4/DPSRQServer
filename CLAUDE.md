@@ -11,6 +11,8 @@ Go-бэкенд для хранения игровых логов, таблиц 
 
 ```
 cmd/server/main.go          ← точка входа, wiring, graceful shutdown
+cmd/party_scenario/main.go  ← интеграционный сценарий: 3 игрока в комнате
+cmd/throttle_scenario/main.go ← интеграционный сценарий: проверка throttle
 internal/
 ├── config/config.go        ← конфигурация из env
 ├── model/models.go         ← доменные типы (User, GameLog, etc.)
@@ -30,7 +32,7 @@ internal/
 │   ├── gamelog.go          ← BatchInsert (COPY + ON CONFLICT), GetUserStats
 │   └── leaderboard.go      ← GetLeaderboard, RefreshView
 └── partysync/              ← gRPC bidirectional sync
-    ├── hub.go              ← Hub: комнаты, снапшоты, broadcast
+    ├── hub.go              ← Hub: комнаты, снапшоты, throttled broadcast (300ms)
     ├── service.go          ← gRPC PartySync сервис с JWT auth
     └── pb/                 ← сгенерированный protobuf-код (не .gitignore)
 proto/
@@ -100,8 +102,13 @@ rpc SyncDamage(stream DamageUpdate) returns (stream PartyState);
 1. `authStreamInterceptor` валидирует JWT из metadata
 2. `partySyncService.SyncDamage` ждёт первый `DamageUpdate` с `room`
 3. `hub.Join(room, username, stream)` — регистрация
-4. Loop: `stream.Recv()` → `hub.Update()` → broadcast `PartyState` всем в комнате
-5. Disconnect / EOF → `hub.Leave()`, комната удаляется если пустая
+4. Loop: `stream.Recv()` → `hub.Update()` — сохраняет снапшот, помечает комнату dirty
+5. Per-room тикер 300 мс — делает broadcast если dirty, сбрасывает флаг
+6. Disconnect / EOF → `hub.Leave()`, комната удаляется если пустая
+
+**Throttle:** каждая комната имеет одну горутину-тикер (`DefaultBroadcastInterval = 300ms`).
+`Update()` только записывает снапшот и ставит `dirty=true`. Broadcast происходит не чаще раза в 300 мс,
+все апдейты внутри одного тика батчатся в одну отправку `PartyState`.
 
 **Регенерация pb-кода:**
 ```bash
@@ -171,17 +178,19 @@ type statsLogRepository interface {
 
 ## Тесты
 
+### Unit-тесты
+
 ```bash
 make test          # все тесты
 go test ./... -v   # с именами
 go test -run Hub   # конкретный паттерн
 ```
 
-**44 unit-теста** — все без реальной БД:
+**45 unit-тестов** — все без реальной БД:
 
 | Пакет | Что тестируется |
 |-------|----------------|
-| `internal/partysync` | Hub: Join/Leave, broadcast, изоляция комнат, cleanup, targets |
+| `internal/partysync` | Hub: Join/Leave, broadcast, throttle (10 updates → 1 broadcast), изоляция комнат, cleanup, targets |
 | `internal/service` | AuthService: Register + все ошибки, Login, ValidateToken |
 | `internal/service` | SyncService: empty batch, maxBatchSize, ошибки репо, duplicates |
 | `internal/middleware` | JWT: header, Bearer scheme, tampered, wrong secret, expired |
@@ -189,7 +198,50 @@ go test -run Hub   # конкретный паттерн
 
 **Моки:** определены в `_test.go` файлах (не в production-коде). Имена: `mockUserRepo`, `mockGameLogRepo`, `mockAuthService`, `mockSyncService`, `mockLeaderboardService`, `mockStatsService`.
 
+**Hub-тесты** используют `newHubWithInterval(5ms)` и вспомогательную функцию `tick()` (`sleep 20ms`) для ожидания тика перед проверкой broadcast.
+
 **Не покрыто:** repository-слой (требует реальной БД), `cmd/server/main.go`.
+
+### Интеграционные сценарии
+
+Требуют запущенного сервера (`JWT_SECRET=test-secret make run`).
+
+#### party_scenario — 3 игрока в одной комнате
+
+```bash
+go run ./cmd/party_scenario/
+```
+
+Что проверяет:
+1. Регистрирует Alice, Bob, Carol через HTTP `/auth/register`
+2. Каждый открывает gRPC bidirectional stream с JWT auth
+3. Каждый отправляет `DamageUpdate` со своим уроном и списком целей
+4. Каждый ждёт `PartyState` пока не увидит всех 3 игроков (пересылает апдейты если нужно)
+5. Проверяет: все 3 игрока видят консолидированный `PartyState` со всеми участниками
+
+Ожидаемый вывод:
+```
+━━━ RESULT: ALL CHECKS PASSED ✓ ━━━
+```
+
+#### throttle_scenario — проверка батчинга broadcast
+
+```bash
+go run ./cmd/throttle_scenario/
+```
+
+Что проверяет:
+1. Отправляет 10 `DamageUpdate` подряд (за ~700 мкс)
+2. Слушает ответы 700 мс (покрывает ~2 тика по 300 мс)
+3. Проверяет: получен **≤2 broadcast** (все 10 апдейтов батчатся в 1–2 отправки)
+4. Проверяет: последний `TotalDamage` = значение из последнего апдейта
+
+Ожидаемый вывод:
+```
+Sent 10 updates in ~700µs
+Received 1 PartyState messages in 700ms (throttle window: 300ms → expect ≤2)
+✓ Throttle OK: 10 rapid updates batched into 1 broadcast(s)
+```
 
 ---
 
@@ -228,7 +280,10 @@ jwt.MapClaims{
 - `cmd/server/main.go` — gRPC сервер на `:50051` + `authStreamInterceptor`
 - `go.mod` — добавлены `grpc v1.68.0`, `protobuf v1.36.0`
 - Интерфейсы в service и handler пакетах для тестируемости
-- **44 unit-теста** для hub, auth service, sync service, middleware, handlers
+- **45 unit-тестов** для hub, auth service, sync service, middleware, handlers
+- Hub throttle: `DefaultBroadcastInterval = 300ms`, per-room goroutine + `atomic.Bool dirty`
+- `cmd/party_scenario/` — интеграционный сценарий: 3 игрока, консолидированный PartyState
+- `cmd/throttle_scenario/` — интеграционный сценарий: 10 апдейтов → 1 broadcast
 - Репо переименовано: `GameLogServer` → `DPSRQServer`
 
 ### Initial commit (11.02.2026)
