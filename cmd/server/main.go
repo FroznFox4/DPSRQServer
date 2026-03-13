@@ -4,19 +4,25 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/kirill/gamelogserver/internal/config"
 	"github.com/kirill/gamelogserver/internal/handler"
 	"github.com/kirill/gamelogserver/internal/middleware"
+	"github.com/kirill/gamelogserver/internal/partysync"
+	pb "github.com/kirill/gamelogserver/internal/partysync/pb"
 	"github.com/kirill/gamelogserver/internal/repository"
 	"github.com/kirill/gamelogserver/internal/service"
 )
@@ -94,6 +100,13 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// gRPC server on :50051
+	grpcSrv := grpc.NewServer(
+		grpc.StreamInterceptor(authStreamInterceptor(authService)),
+	)
+	hub := partysync.NewHub()
+	pb.RegisterPartySyncServer(grpcSrv, partysync.NewService(hub, authService))
+
 	// Graceful shutdown
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -102,9 +115,22 @@ func main() {
 		log.Println("shutting down...")
 		cancel()
 
+		grpcSrv.GracefulStop()
+
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		srv.Shutdown(shutdownCtx)
+	}()
+
+	grpcLis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("grpc listen: %v", err)
+	}
+	go func() {
+		log.Println("gRPC server starting on :50051")
+		if err := grpcSrv.Serve(grpcLis); err != nil {
+			log.Printf("gRPC server stopped: %v", err)
+		}
 	}()
 
 	log.Printf("server starting on %s", addr)
@@ -112,4 +138,22 @@ func main() {
 		log.Fatalf("server: %v", err)
 	}
 	log.Println("server stopped")
+}
+
+func authStreamInterceptor(authSvc *service.AuthService) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		md, ok := metadata.FromIncomingContext(ss.Context())
+		if !ok {
+			return fmt.Errorf("missing metadata")
+		}
+		tokens := md.Get("authorization")
+		if len(tokens) == 0 {
+			return fmt.Errorf("missing authorization")
+		}
+		tokenStr := strings.TrimPrefix(tokens[0], "Bearer ")
+		if _, _, err := authSvc.ValidateToken(tokenStr); err != nil {
+			return fmt.Errorf("invalid token: %w", err)
+		}
+		return handler(srv, ss)
+	}
 }

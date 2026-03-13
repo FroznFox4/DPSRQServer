@@ -1,0 +1,35 @@
+syntax = "proto3";
+package partysync;
+option go_package = "github.com/kirill/gamelogserver/internal/partysync/pb";
+
+service PartySync {
+  // Каждый клиент открывает один bidirectional stream:
+  // → шлёт свои DamageUpdate каждые ~2с
+  // ← получает PartyState всей комнаты после каждого обновления
+  rpc SyncDamage(stream DamageUpdate) returns (stream PartyState);
+}
+
+message TargetDamage {
+  string name   = 1;
+  int64  amount = 2;
+}
+
+message DamageUpdate {
+  string player       = 1;
+  string room         = 2;
+  int64  total_damage = 3;
+  repeated TargetDamage targets = 4;
+  int64  last_hit     = 5;
+  string last_hit_ts  = 6;
+}
+
+message PlayerSnapshot {
+  int64  total_damage = 1;
+  repeated TargetDamage targets = 2;
+  int64  last_hit     = 3;
+  string last_hit_ts  = 4;
+}
+
+message PartyState {
+  map<string, PlayerSnapshot> players = 1;  // playerName → snapshot
+}
