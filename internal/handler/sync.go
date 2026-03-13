@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -9,8 +10,12 @@ import (
 	"github.com/kirill/gamelogserver/internal/service"
 )
 
+type syncServiceIface interface {
+	SyncLogs(ctx context.Context, userID int, req *model.SyncRequest) (*model.SyncResponse, error)
+}
+
 type SyncHandler struct {
-	syncService *service.SyncService
+	syncService syncServiceIface
 }
 
 func NewSyncHandler(syncService *service.SyncService) *SyncHandler {

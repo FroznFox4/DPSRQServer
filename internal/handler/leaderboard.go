@@ -1,15 +1,21 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/kirill/gamelogserver/internal/model"
 	"github.com/kirill/gamelogserver/internal/service"
 )
 
+type leaderboardServiceIface interface {
+	GetLeaderboard(ctx context.Context, category string, limit int) ([]model.LeaderboardEntry, error)
+}
+
 type LeaderboardHandler struct {
-	lbService *service.LeaderboardService
+	lbService leaderboardServiceIface
 }
 
 func NewLeaderboardHandler(lbService *service.LeaderboardService) *LeaderboardHandler {

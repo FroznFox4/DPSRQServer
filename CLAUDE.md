@@ -1,207 +1,238 @@
-# Game Log Server
+# DPSRQServer
+
+Go-бэкенд для хранения игровых логов, таблиц лидеров и синхронизации урона группы в реальном времени.
+
+**GitHub:** `github.com/FroznFox4/DPSRQServer`
+**Клиент:** RQWatcher (Rust/Tauri) — отправляет логи через HTTP и синхронизирует урон группы через gRPC.
+
+---
 
 ## Архитектура
 
-Go HTTP-сервер, принимающий синхронизированные игровые логи от клиентов (Game Log Monitor) и предоставляющий лидерборды и статистику.
+```
+cmd/server/main.go          ← точка входа, wiring, graceful shutdown
+internal/
+├── config/config.go        ← конфигурация из env
+├── model/models.go         ← доменные типы (User, GameLog, etc.)
+├── handler/                ← HTTP-обработчики (chi)
+│   ├── auth.go             ← POST /register, /login
+│   ├── sync.go             ← POST /logs/sync
+│   ├── leaderboard.go      ← GET /leaderboard/{category}
+│   └── stats.go            ← GET /stats/me
+├── middleware/auth.go       ← JWT middleware, GetUserID(ctx)
+├── service/                ← бизнес-логика
+│   ├── auth.go             ← Register, Login, ValidateToken
+│   ├── sync.go             ← SyncLogs (batch validation)
+│   ├── leaderboard.go      ← GetLeaderboard + cache + background refresh
+│   └── stats.go            ← GetUserStats (делегация)
+├── repository/             ← доступ к PostgreSQL (pgx)
+│   ├── user.go             ← Create, GetByUsername
+│   ├── gamelog.go          ← BatchInsert (COPY + ON CONFLICT), GetUserStats
+│   └── leaderboard.go      ← GetLeaderboard, RefreshView
+└── partysync/              ← gRPC bidirectional sync
+    ├── hub.go              ← Hub: комнаты, снапшоты, broadcast
+    ├── service.go          ← gRPC PartySync сервис с JWT auth
+    └── pb/                 ← сгенерированный protobuf-код (не .gitignore)
+proto/
+└── partysync.proto         ← source of truth gRPC контракта
+migrations/                 ← SQL (golang-migrate)
+```
 
-```
-GameLogServer
-├── HTTP API (chi router)
-├── JWT Auth (bcrypt + HS256)
-├── PostgreSQL (pgx pool)
-├── Batch Sync (COPY protocol)
-└── Leaderboard Cache (background goroutine)
-```
+**Стек:** Go 1.25, chi v5, pgx v5, golang-jwt v5, bcrypt, gRPC v1.68, protobuf v1.36, PostgreSQL 16.
 
 ---
 
 ## Сборка и запуск
 
-### Требования
-- Go 1.22+
-- PostgreSQL 16 (или Docker)
-- golang-migrate CLI
-
-### Команды
-
 ```bash
-# PostgreSQL
-docker-compose up -d
+# Зависимости
+docker-compose up -d    # PostgreSQL
+make migrate-up         # применить миграции
 
-# Миграции
-make migrate-up
-
-# Запуск сервера
-JWT_SECRET=my-secret make run
-
-# Сборка бинарника
-make build          # → bin/server
-
-# Тесты
-make test
+# Запуск
+JWT_SECRET=my-secret make run   # dev
+make build                      # → bin/server
 ```
+
+**Переменные окружения:**
+
+| Переменная | По умолчанию | Обязательна |
+|-----------|-------------|-------------|
+| `JWT_SECRET` | — | **Да** |
+| `PORT` | `8080` | Нет |
+| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/gamelogserver?sslmode=disable` | Нет |
 
 ---
 
-## Структура проекта
+## HTTP API
 
-```
-cmd/
-└── server/
-    └── main.go                  # Точка входа, wiring, graceful shutdown
-internal/
-├── config/
-│   └── config.go                # Env-based: PORT, DATABASE_URL, JWT_SECRET
-├── model/
-│   └── models.go                # User, GameLog, SyncRequest/Response, LeaderboardEntry, UserStats
-├── handler/
-│   ├── auth.go                  # POST /register, POST /login + writeJSON/writeError хелперы
-│   ├── sync.go                  # POST /logs/sync
-│   ├── leaderboard.go           # GET /leaderboard/{category}
-│   └── stats.go                 # GET /stats/me
-├── middleware/
-│   └── auth.go                  # JWT validation, context keys (UserIDKey, UsernameKey)
-├── repository/
-│   ├── user.go                  # Create, GetByUsername
-│   ├── gamelog.go               # BatchInsert (temp table + CopyFrom + ON CONFLICT), GetUserStats
-│   └── leaderboard.go           # GetLeaderboard, RefreshView
-└── service/
-    ├── auth.go                  # Register, Login, generateToken, ValidateToken
-    ├── sync.go                  # SyncLogs (валидация batch size, делегация в repo)
-    ├── leaderboard.go           # GetLeaderboard (cache), StartRefresh (background goroutine)
-    └── stats.go                 # GetUserStats (делегация в repo)
-migrations/
-├── 001_create_users.up.sql
-├── 001_create_users.down.sql
-├── 002_create_game_logs.up.sql
-├── 002_create_game_logs.down.sql
-├── 003_create_leaderboard_view.up.sql
-└── 003_create_leaderboard_view.down.sql
-```
-
----
-
-## Конфигурация
-
-Файл: `internal/config/config.go`
-
-| Переменная | Значение по умолчанию | Описание |
-|------------|----------------------|----------|
-| `PORT` | `8080` | Порт сервера |
-| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/gamelogserver?sslmode=disable` | PostgreSQL connection string |
-| `JWT_SECRET` | — (обязательно) | Секрет для подписи JWT |
-
----
-
-## API Endpoints
-
-Все эндпоинты под `/api/v1`.
+**Base:** `/api/v1`
 
 ### Публичные
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| POST | `/auth/register` | Регистрация, возвращает JWT |
-| POST | `/auth/login` | Логин, возвращает JWT |
-| GET | `/leaderboard/{category}` | Лидерборд (exp, gold, kills, items) |
+| POST | `/auth/register` | Регистрация (username 3–50 симв, password ≥6) |
+| POST | `/auth/login` | Логин → JWT (72ч, HS256) |
+| GET | `/leaderboard/{category}?limit=10` | Лидерборд (`exp`/`gold`/`kills`/`items`, limit 1–100) |
 
-### Защищённые (требуют `Authorization: Bearer <token>`)
+### Защищённые (`Authorization: Bearer <jwt>`)
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| POST | `/logs/sync` | Загрузка логов (batch до 1000) |
+| POST | `/logs/sync` | Batch-загрузка логов (макс 1000 за раз) |
 | GET | `/stats/me` | Статистика текущего пользователя |
 
+Ошибки: `{"error": "описание"}`.
+
 ---
 
-## PostgreSQL Schema
+## gRPC (порт 50051)
 
-### users
+**Сервис:** `PartySync::SyncDamage` — bidirectional stream.
+**Auth:** JWT в metadata `authorization: Bearer <token>`.
+
+```protobuf
+rpc SyncDamage(stream DamageUpdate) returns (stream PartyState);
+```
+
+**Жизненный цикл стрима:**
+1. `authStreamInterceptor` валидирует JWT из metadata
+2. `partySyncService.SyncDamage` ждёт первый `DamageUpdate` с `room`
+3. `hub.Join(room, username, stream)` — регистрация
+4. Loop: `stream.Recv()` → `hub.Update()` → broadcast `PartyState` всем в комнате
+5. Disconnect / EOF → `hub.Leave()`, комната удаляется если пустая
+
+**Регенерация pb-кода:**
+```bash
+make proto   # требует protoc + protoc-gen-go + protoc-gen-go-grpc в PATH
+```
+pb-файлы коммитятся в репозиторий (не игнорируются).
+
+---
+
+## База данных
+
+### Схема
+
+**`users`:** `id, username UNIQUE, password_hash, created_at`
+
+**`game_logs`:**
+```
+id, user_id, client_id, timestamp, time, kind, action, name, amount, count, exp, raw_text, synced_at
+UNIQUE(user_id, client_id)  — дедупликация
+```
+`kind`: `gold`, `monster`, `item`, `damage`, `other`
+
+**`leaderboard_summary`** — материализованное view, refresh каждые 60 сек:
 ```sql
-id SERIAL PRIMARY KEY
-username VARCHAR(50) UNIQUE NOT NULL
-password_hash VARCHAR(255) NOT NULL
-created_at TIMESTAMPTZ DEFAULT NOW()
+(user_id, username, total_gold, total_exp, total_kills, total_items)
 ```
 
-### game_logs
-```sql
-id BIGSERIAL PRIMARY KEY
-user_id INTEGER NOT NULL REFERENCES users(id)
-client_id INTEGER NOT NULL              -- SQLite id клиента (для дедупликации)
-timestamp TIMESTAMPTZ NOT NULL
-time TEXT
-kind VARCHAR(20) NOT NULL               -- gold, item, monster, other
-action VARCHAR(20)
-name TEXT
-amount BIGINT
-count INTEGER
-exp BIGINT
-raw_text TEXT
-synced_at TIMESTAMPTZ DEFAULT NOW()
-UNIQUE(user_id, client_id)              -- дедупликация по клиенту
-```
+### BatchInsert
 
-Индексы: `user_id`, `kind`, `timestamp`, `(user_id, kind)`.
-
-### leaderboard_summary (MATERIALIZED VIEW)
-```sql
-user_id, username, total_gold, total_exp, total_kills, total_items
-```
-Обновляется `REFRESH MATERIALIZED VIEW CONCURRENTLY` каждые 60 секунд фоновой горутиной.
+`GameLogRepo.BatchInsert`: BEGIN → `CREATE TEMP TABLE _staging ON COMMIT DROP` → `COPY` → `INSERT ... SELECT ... ON CONFLICT DO NOTHING` → COMMIT.
 
 ---
 
-## Ключевые паттерны
+## Интерфейсы для тестируемости
 
-### Batch Insert (sync endpoint)
-1. Создание `TEMP TABLE _staging ON COMMIT DROP`
-2. `pgx.CopyFrom` (COPY protocol) в temp таблицу
-3. `INSERT INTO game_logs ... SELECT FROM _staging ON CONFLICT DO NOTHING`
-4. Всё в одной транзакции
+Каждый сервис принимает **интерфейс** репозитория (определён в service-пакете):
 
-### Leaderboard Cache
-- `sync.RWMutex` защищает `map[string][]LeaderboardEntry`
-- Фоновая горутина: `REFRESH MATERIALIZED VIEW` + query → cache каждые 60с
-- При cache miss — прямой запрос в БД
+```go
+// service/auth.go
+type userRepository interface {
+    Create(ctx, username, hash) (*model.User, error)
+    GetByUsername(ctx, username) (*model.User, error)
+}
 
-### JWT Auth
-- HS256, 72 часа expiration
-- Middleware извлекает `user_id` и `username` в `context.Context`
-- Хелпер `middleware.GetUserID(ctx)` для хэндлеров
+// service/sync.go
+type gameLogRepository interface {
+    BatchInsert(ctx, userID, logs) (inserted, duplicates int, error)
+}
+
+// service/stats.go
+type statsLogRepository interface {
+    GetUserStats(ctx, userID) (*model.UserStats, error)
+}
+```
+
+Каждый handler принимает **интерфейс** сервиса (определён в handler-пакете):
+```go
+// handler/auth.go   → authServiceIface
+// handler/sync.go   → syncServiceIface
+// handler/leaderboard.go → leaderboardServiceIface
+// handler/stats.go  → statsServiceIface
+```
+
+`*repository.*Repo` и `*service.*Service` удовлетворяют интерфейсам неявно → `main.go` не меняется.
 
 ---
 
-## Слои приложения
-
-```
-Handler → Service → Repository → pgxpool.Pool → PostgreSQL
-```
-
-- **Handler**: HTTP decode/encode, вызов сервиса, возврат JSON
-- **Service**: бизнес-логика, валидация, кэширование
-- **Repository**: SQL-запросы через pgx
-
-Все зависимости инжектятся через конструкторы в `main.go`.
-
----
-
-## Тестирование
+## Тесты
 
 ```bash
-make test
+make test          # все тесты
+go test ./... -v   # с именами
+go test -run Hub   # конкретный паттерн
 ```
+
+**44 unit-теста** — все без реальной БД:
+
+| Пакет | Что тестируется |
+|-------|----------------|
+| `internal/partysync` | Hub: Join/Leave, broadcast, изоляция комнат, cleanup, targets |
+| `internal/service` | AuthService: Register + все ошибки, Login, ValidateToken |
+| `internal/service` | SyncService: empty batch, maxBatchSize, ошибки репо, duplicates |
+| `internal/middleware` | JWT: header, Bearer scheme, tampered, wrong secret, expired |
+| `internal/handler` | Auth/Sync/Leaderboard/Stats: happy path + 401/400/500 |
+
+**Моки:** определены в `_test.go` файлах (не в production-коде). Имена: `mockUserRepo`, `mockGameLogRepo`, `mockAuthService`, `mockSyncService`, `mockLeaderboardService`, `mockStatsService`.
+
+**Не покрыто:** repository-слой (требует реальной БД), `cmd/server/main.go`.
 
 ---
 
-## Docker
+## JWT
 
-```bash
-# PostgreSQL для разработки
-docker-compose up -d
-
-# Сборка образа сервера
-docker build -t gamelogserver .
+Алгоритм: **HS256**. Claims:
+```go
+jwt.MapClaims{
+    "user_id":  userID,   // float64 при декодировании → int()
+    "username": username,
+    "exp":      now + 72h,
+    "iat":      now,
+}
 ```
+`ValidateToken` возвращает `(userID int, username string, error)`.
 
-Multi-stage build: `golang:1.22-alpine` → `alpine:3.19`.
+---
+
+## Makefile
+
+| Цель | Описание |
+|------|----------|
+| `proto` | Regenerate `internal/partysync/pb/` из `proto/partysync.proto` |
+| `build` | Сборка в `bin/server` |
+| `run` | `go run ./cmd/server` |
+| `test` | `go test ./...` |
+| `migrate-up/down` | Управление миграциями |
+| `docker-up/down` | PostgreSQL контейнер |
+
+---
+
+## История изменений
+
+### feature/party-damage-sync (13.03.2026)
+- `proto/partysync.proto` + `internal/partysync/` — gRPC PartySync bidirectional stream
+- `cmd/server/main.go` — gRPC сервер на `:50051` + `authStreamInterceptor`
+- `go.mod` — добавлены `grpc v1.68.0`, `protobuf v1.36.0`
+- Интерфейсы в service и handler пакетах для тестируемости
+- **44 unit-теста** для hub, auth service, sync service, middleware, handlers
+- Репо переименовано: `GameLogServer` → `DPSRQServer`
+
+### Initial commit (11.02.2026)
+- HTTP API: register, login, sync logs, stats, leaderboard
+- Batch insert с дедупликацией через COPY + ON CONFLICT
+- Материализованное view для leaderboard с фоновым refresh каждые 60с
+- Docker + golang-migrate

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -8,8 +9,14 @@ import (
 	"github.com/kirill/gamelogserver/internal/service"
 )
 
+type authServiceIface interface {
+	Register(ctx context.Context, username, password string) (*model.AuthResponse, error)
+	Login(ctx context.Context, username, password string) (*model.AuthResponse, error)
+	ValidateToken(tokenString string) (int, string, error)
+}
+
 type AuthHandler struct {
-	authService *service.AuthService
+	authService authServiceIface
 }
 
 func NewAuthHandler(authService *service.AuthService) *AuthHandler {

@@ -1,14 +1,20 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/kirill/gamelogserver/internal/middleware"
+	"github.com/kirill/gamelogserver/internal/model"
 	"github.com/kirill/gamelogserver/internal/service"
 )
 
+type statsServiceIface interface {
+	GetUserStats(ctx context.Context, userID int) (*model.UserStats, error)
+}
+
 type StatsHandler struct {
-	statsService *service.StatsService
+	statsService statsServiceIface
 }
 
 func NewStatsHandler(statsService *service.StatsService) *StatsHandler {

@@ -10,8 +10,13 @@ import (
 
 const maxBatchSize = 1000
 
+// gameLogRepository is the subset of *repository.GameLogRepo used by SyncService.
+type gameLogRepository interface {
+	BatchInsert(ctx context.Context, userID int, logs []model.SyncLogEntry) (inserted, duplicates int, err error)
+}
+
 type SyncService struct {
-	gameLogRepo *repository.GameLogRepo
+	gameLogRepo gameLogRepository
 }
 
 func NewSyncService(gameLogRepo *repository.GameLogRepo) *SyncService {

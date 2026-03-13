@@ -11,15 +11,21 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/kirill/gamelogserver/internal/model"
-	"github.com/kirill/gamelogserver/internal/repository"
 )
 
+// userRepository is the subset of *repository.UserRepo used by AuthService.
+// Defined here to allow test mocks without changing the repository package.
+type userRepository interface {
+	Create(ctx context.Context, username, passwordHash string) (*model.User, error)
+	GetByUsername(ctx context.Context, username string) (*model.User, error)
+}
+
 type AuthService struct {
-	userRepo  *repository.UserRepo
+	userRepo  userRepository
 	jwtSecret []byte
 }
 
-func NewAuthService(userRepo *repository.UserRepo, jwtSecret string) *AuthService {
+func NewAuthService(userRepo userRepository, jwtSecret string) *AuthService {
 	return &AuthService{
 		userRepo:  userRepo,
 		jwtSecret: []byte(jwtSecret),
