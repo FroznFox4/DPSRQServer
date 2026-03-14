@@ -5,30 +5,25 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 
 	pb "github.com/kirill/gamelogserver/internal/partysync/pb"
 )
 
 const (
-	httpBase = "http://localhost:8080/api/v1"
 	grpcAddr = "localhost:50051"
 	room     = "test-room"
 )
 
 type player struct {
 	name        string
-	token       string
 	totalDamage int64
 	targets     []*pb.TargetDamage
 }
@@ -47,18 +42,6 @@ func main() {
 		}},
 	}
 
-	// 1. Register all players
-	fmt.Println("━━━ [1] Registering players ━━━")
-	for i := range players {
-		tok, err := register(players[i].name)
-		if err != nil {
-			log.Fatalf("register %s: %v", players[i].name, err)
-		}
-		players[i].token = tok
-		fmt.Printf("  ✓ %s registered\n", players[i].name)
-	}
-
-	// 2. Connect gRPC
 	conn, err := grpc.NewClient(grpcAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -66,8 +49,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	// 3. Each player opens a bidirectional stream and sends one DamageUpdate
-	fmt.Println("\n━━━ [2] Opening gRPC streams ━━━")
+	fmt.Println("━━━ [1] Opening gRPC streams ━━━")
 	type result struct {
 		playerName string
 		state      *pb.PartyState
@@ -85,14 +67,12 @@ func main() {
 		}(p)
 	}
 
-	// Close results channel when all goroutines finish
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// 4. Collect and print results
-	fmt.Println("\n━━━ [3] Party state received by each player ━━━")
+	fmt.Println("\n━━━ [2] Party state received by each player ━━━")
 	allOk := true
 	for r := range results {
 		if r.err != nil {
@@ -106,7 +86,6 @@ func main() {
 				name, snap.TotalDamage, snap.LastHit, formatTargets(snap.Targets))
 		}
 
-		// Validate: must see all 3 players
 		if len(r.state.Players) != 3 {
 			fmt.Printf("  ✗ %s: expected 3 players in PartyState, got %d\n", r.playerName, len(r.state.Players))
 			allOk = false
@@ -127,16 +106,12 @@ func runPlayer(conn *grpc.ClientConn, p player) (*pb.PartyState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	md := metadata.Pairs("authorization", "Bearer "+p.token)
-	ctx = metadata.NewOutgoingContext(ctx, md)
-
 	client := pb.NewPartySyncClient(conn)
 	stream, err := client.SyncDamage(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open stream: %w", err)
 	}
 
-	// Send damage update
 	err = stream.Send(&pb.DamageUpdate{
 		Player:      p.name,
 		Room:        room,
@@ -149,7 +124,6 @@ func runPlayer(conn *grpc.ClientConn, p player) (*pb.PartyState, error) {
 		return nil, fmt.Errorf("send: %w", err)
 	}
 
-	// Wait until we get a PartyState with all 3 players (or timeout)
 	for {
 		state, err := stream.Recv()
 		if err == io.EOF {
@@ -162,7 +136,6 @@ func runPlayer(conn *grpc.ClientConn, p player) (*pb.PartyState, error) {
 			stream.CloseSend()
 			return state, nil
 		}
-		// Partial state (only 1-2 players so far) — wait a bit and send another update
 		time.Sleep(200 * time.Millisecond)
 		_ = stream.Send(&pb.DamageUpdate{
 			Player:      p.name,
@@ -186,34 +159,4 @@ func formatTargets(targets []*pb.TargetDamage) string {
 	}
 	buf.WriteString("]")
 	return buf.String()
-}
-
-// register calls POST /auth/register; if username taken, falls back to login.
-func register(username string) (string, error) {
-	body, _ := json.Marshal(map[string]string{"username": username, "password": "secret123"})
-	resp, err := http.Post(httpBase+"/auth/register", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-
-	var out map[string]any
-	json.Unmarshal(raw, &out)
-
-	if tok, ok := out["token"].(string); ok {
-		return tok, nil
-	}
-	// username already taken — login instead
-	resp2, err := http.Post(httpBase+"/auth/login", "application/json",
-		bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	defer resp2.Body.Close()
-	json.NewDecoder(resp2.Body).Decode(&out)
-	if tok, ok := out["token"].(string); ok {
-		return tok, nil
-	}
-	return "", fmt.Errorf("could not register or login: %s", raw)
 }
