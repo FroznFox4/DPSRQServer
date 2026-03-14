@@ -60,16 +60,23 @@ func newTestHub() *Hub { return newHubWithInterval(5 * time.Millisecond) }
 // tick waits long enough for at least one broadcast tick to fire.
 func tick() { time.Sleep(20 * time.Millisecond) }
 
+func mustJoin(t *testing.T, hub *Hub, room, player string, s pb.PartySync_SyncDamageServer) <-chan struct{} {
+	t.Helper()
+	done, err := hub.Join(room, player, s)
+	if err != nil {
+		t.Fatalf("Join(%q, %q) unexpected error: %v", room, player, err)
+	}
+	return done
+}
+
+// --- existing tests ---
+
 func TestHub_JoinAndUpdate_BroadcastsToJoinedStream(t *testing.T) {
 	hub := newTestHub()
 	s := newMockStream()
 
-	hub.Join("room1", "Alice", s)
-	hub.Update("room1", &pb.DamageUpdate{
-		Player:      "Alice",
-		Room:        "room1",
-		TotalDamage: 500,
-	})
+	mustJoin(t, hub, "room1", "Alice", s)
+	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 500})
 	tick()
 
 	if s.sentCount() == 0 {
@@ -89,8 +96,8 @@ func TestHub_MultiplePlayersReceiveAllBroadcasts(t *testing.T) {
 	sA := newMockStream()
 	sB := newMockStream()
 
-	hub.Join("room1", "Alice", sA)
-	hub.Join("room1", "Bob", sB)
+	mustJoin(t, hub, "room1", "Alice", sA)
+	mustJoin(t, hub, "room1", "Bob", sB)
 
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
 	hub.Update("room1", &pb.DamageUpdate{Player: "Bob", Room: "room1", TotalDamage: 200})
@@ -103,7 +110,6 @@ func TestHub_MultiplePlayersReceiveAllBroadcasts(t *testing.T) {
 		t.Error("Bob: expected at least 1 broadcast, got 0")
 	}
 
-	// Both players must appear in the last broadcast
 	last := sA.lastSent()
 	if _, ok := last.Players["Alice"]; !ok {
 		t.Error("Alice missing from final state")
@@ -116,7 +122,7 @@ func TestHub_MultiplePlayersReceiveAllBroadcasts(t *testing.T) {
 func TestHub_PartyStateContainsLatestSnapshot(t *testing.T) {
 	hub := newTestHub()
 	s := newMockStream()
-	hub.Join("room1", "Alice", s)
+	mustJoin(t, hub, "room1", "Alice", s)
 
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 900})
@@ -134,9 +140,8 @@ func TestHub_PartyStateContainsLatestSnapshot(t *testing.T) {
 func TestHub_ThrottlesBatchedUpdatesIntoOneBroadcast(t *testing.T) {
 	hub := newTestHub()
 	s := newMockStream()
-	hub.Join("room1", "Alice", s)
+	mustJoin(t, hub, "room1", "Alice", s)
 
-	// Send 10 updates within a single tick window — expect exactly 1 broadcast.
 	for i := 0; i < 10; i++ {
 		hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: int64(i * 100)})
 	}
@@ -154,7 +159,7 @@ func TestHub_Leave_StopsReceivingBroadcasts(t *testing.T) {
 	hub := newTestHub()
 	s := newMockStream()
 
-	hub.Join("room1", "Alice", s)
+	mustJoin(t, hub, "room1", "Alice", s)
 	hub.Leave("room1", "Alice")
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 999})
 	tick()
@@ -169,8 +174,8 @@ func TestHub_Leave_RemovesSnapshotFromBroadcast(t *testing.T) {
 	sA := newMockStream()
 	sB := newMockStream()
 
-	hub.Join("room1", "Alice", sA)
-	hub.Join("room1", "Bob", sB)
+	mustJoin(t, hub, "room1", "Alice", sA)
+	mustJoin(t, hub, "room1", "Bob", sB)
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
 	hub.Update("room1", &pb.DamageUpdate{Player: "Bob", Room: "room1", TotalDamage: 200})
 	tick()
@@ -192,7 +197,7 @@ func TestHub_EmptyRoomDeletedAfterLastLeave(t *testing.T) {
 	hub := newTestHub()
 	s := newMockStream()
 
-	hub.Join("room1", "Alice", s)
+	mustJoin(t, hub, "room1", "Alice", s)
 	hub.Leave("room1", "Alice")
 
 	hub.mu.RLock()
@@ -217,7 +222,7 @@ func TestHub_LeaveUnknownRoom_DoesNotPanic(t *testing.T) {
 func TestHub_TargetDamagePreservedInSnapshot(t *testing.T) {
 	hub := newTestHub()
 	s := newMockStream()
-	hub.Join("room1", "Alice", s)
+	mustJoin(t, hub, "room1", "Alice", s)
 
 	hub.Update("room1", &pb.DamageUpdate{
 		Player:      "Alice",
@@ -249,8 +254,8 @@ func TestHub_MultipleRoomsAreIsolated(t *testing.T) {
 	s1 := newMockStream()
 	s2 := newMockStream()
 
-	hub.Join("room1", "Alice", s1)
-	hub.Join("room2", "Bob", s2)
+	mustJoin(t, hub, "room1", "Alice", s1)
+	mustJoin(t, hub, "room2", "Bob", s2)
 
 	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
 	tick()
@@ -260,5 +265,131 @@ func TestHub_MultipleRoomsAreIsolated(t *testing.T) {
 	}
 	if s2.sentCount() != 0 {
 		t.Errorf("room2: expected 0 broadcasts (isolated), got %d", s2.sentCount())
+	}
+}
+
+// --- new tests ---
+
+func TestHub_DuplicatePlayerName_ReturnsError(t *testing.T) {
+	hub := newTestHub()
+	s1 := newMockStream()
+	s2 := newMockStream()
+
+	mustJoin(t, hub, "room1", "Alice", s1)
+
+	_, err := hub.Join("room1", "Alice", s2)
+	if err == nil {
+		t.Fatal("expected error when joining with duplicate player name, got nil")
+	}
+}
+
+func TestHub_MaxPlayersPerRoom_ReturnsError(t *testing.T) {
+	hub := newTestHub()
+
+	for i := 0; i < maxPlayersPerRoom; i++ {
+		s := newMockStream()
+		name := string(rune('A' + i))
+		if _, err := hub.Join("room1", name, s); err != nil {
+			t.Fatalf("Join player %d failed unexpectedly: %v", i, err)
+		}
+	}
+
+	extra := newMockStream()
+	_, err := hub.Join("room1", "Extra", extra)
+	if err == nil {
+		t.Fatal("expected error when exceeding max players, got nil")
+	}
+}
+
+func TestHub_RoomClosedAfterInactivity(t *testing.T) {
+	shortRoomTTL := 30 * time.Millisecond
+	hub := newHubWithAll(5*time.Millisecond, snapshotTTL, shortRoomTTL)
+	s := newMockStream()
+
+	done, err := hub.Join("room1", "Alice", s)
+	if err != nil {
+		t.Fatalf("Join failed: %v", err)
+	}
+
+	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
+
+	// Wait longer than roomTTL without sending updates
+	time.Sleep(60 * time.Millisecond)
+
+	select {
+	case <-done:
+		// expected: room was force-closed
+	default:
+		t.Fatal("expected done channel to be closed after inactivity, but it is still open")
+	}
+
+	hub.mu.RLock()
+	_, exists := hub.rooms["room1"]
+	hub.mu.RUnlock()
+	if exists {
+		t.Error("expected room to be removed from hub after inactivity close")
+	}
+}
+
+func TestHub_RoomNotClosedWhileActive(t *testing.T) {
+	shortRoomTTL := 30 * time.Millisecond
+	hub := newHubWithAll(5*time.Millisecond, snapshotTTL, shortRoomTTL)
+	s := newMockStream()
+
+	done, err := hub.Join("room1", "Alice", s)
+	if err != nil {
+		t.Fatalf("Join failed: %v", err)
+	}
+
+	// Send updates continuously to keep the room active
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
+			}
+		}
+	}()
+
+	time.Sleep(60 * time.Millisecond)
+	close(stop)
+
+	select {
+	case <-done:
+		t.Fatal("room was force-closed despite ongoing activity")
+	default:
+		// expected: room is still open
+	}
+}
+
+func TestHub_SnapshotEvictedAfterTTL(t *testing.T) {
+	shortSnapshotTTL := 30 * time.Millisecond
+	hub := newHubWithAll(5*time.Millisecond, shortSnapshotTTL, roomTTL)
+	sA := newMockStream()
+	sB := newMockStream()
+
+	mustJoin(t, hub, "room1", "Alice", sA)
+	mustJoin(t, hub, "room1", "Bob", sB)
+
+	hub.Update("room1", &pb.DamageUpdate{Player: "Alice", Room: "room1", TotalDamage: 100})
+	hub.Update("room1", &pb.DamageUpdate{Player: "Bob", Room: "room1", TotalDamage: 200})
+	tick()
+
+	// Only Bob keeps sending updates; Alice goes silent
+	time.Sleep(60 * time.Millisecond)
+	hub.Update("room1", &pb.DamageUpdate{Player: "Bob", Room: "room1", TotalDamage: 300})
+	tick()
+
+	last := sB.lastSent()
+	if _, ok := last.Players["Alice"]; ok {
+		t.Error("Alice snapshot should have been evicted after TTL")
+	}
+	if snap, ok := last.Players["Bob"]; !ok || snap.TotalDamage != 300 {
+		t.Errorf("Bob should still be present with TotalDamage=300, got %+v", snap)
 	}
 }

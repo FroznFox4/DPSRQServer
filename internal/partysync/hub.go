@@ -34,9 +34,11 @@ type Room struct {
 
 // Hub manages all rooms.
 type Hub struct {
-	rooms    map[string]*Room
-	mu       sync.RWMutex
-	interval time.Duration
+	rooms       map[string]*Room
+	mu          sync.RWMutex
+	interval    time.Duration
+	snapshotTTL time.Duration
+	roomTTL     time.Duration
 }
 
 func NewHub() *Hub {
@@ -45,8 +47,19 @@ func NewHub() *Hub {
 
 func newHubWithInterval(interval time.Duration) *Hub {
 	return &Hub{
-		rooms:    make(map[string]*Room),
-		interval: interval,
+		rooms:       make(map[string]*Room),
+		interval:    interval,
+		snapshotTTL: snapshotTTL,
+		roomTTL:     roomTTL,
+	}
+}
+
+func newHubWithAll(interval, snapshotTTL, roomTTL time.Duration) *Hub {
+	return &Hub{
+		rooms:       make(map[string]*Room),
+		interval:    interval,
+		snapshotTTL: snapshotTTL,
+		roomTTL:     roomTTL,
 	}
 }
 
@@ -66,7 +79,7 @@ func (h *Hub) getOrCreateRoom(roomID string) *Room {
 		cancel:       cancel,
 	}
 	h.rooms[roomID] = r
-	go r.broadcastLoop(ctx, h.interval, func() { h.closeRoom(roomID, r) })
+	go r.broadcastLoop(ctx, h.interval, h.snapshotTTL, h.roomTTL, func() { h.closeRoom(roomID, r) })
 	return r
 }
 
@@ -80,7 +93,7 @@ func (h *Hub) closeRoom(roomID string, r *Room) {
 }
 
 // broadcastLoop ticks every interval, evicts stale snapshots, closes inactive rooms, and broadcasts if dirty.
-func (r *Room) broadcastLoop(ctx context.Context, interval time.Duration, closeRoom func()) {
+func (r *Room) broadcastLoop(ctx context.Context, interval, snapshotTTL, roomTTL time.Duration, closeRoom func()) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -95,7 +108,7 @@ func (r *Room) broadcastLoop(ctx context.Context, interval time.Duration, closeR
 				closeRoom()
 				return
 			}
-			if r.evictStale() {
+			if r.evictStale(snapshotTTL) {
 				r.dirty.Store(true)
 			}
 			if r.dirty.Swap(false) {
@@ -105,14 +118,14 @@ func (r *Room) broadcastLoop(ctx context.Context, interval time.Duration, closeR
 	}
 }
 
-// evictStale removes snapshots not updated within snapshotTTL. Returns true if any were removed.
-func (r *Room) evictStale() bool {
+// evictStale removes snapshots not updated within ttl. Returns true if any were removed.
+func (r *Room) evictStale(ttl time.Duration) bool {
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	evicted := false
 	for player, t := range r.lastUpdated {
-		if now.Sub(t) > snapshotTTL {
+		if now.Sub(t) > ttl {
 			delete(r.snapshots, player)
 			delete(r.lastUpdated, player)
 			evicted = true
